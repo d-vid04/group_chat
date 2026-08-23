@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-const ADDRESS: &str = "127.0.0.1:8080";
-const DEFAULT_ROOM: &str = "general";
+use group_chat::protocol::{ADDRESS, DEFAULT_ROOM, ROOM_PREFIX};
+
 
 const HELP: &str = r"Available commands:
   \help                   show this message
@@ -44,7 +44,7 @@ fn send_line(stream: &mut TcpStream, message: &str) -> std::io::Result<()> {
 // Tell one client which room they are in. The client uses this to update its
 // prompt and does not show it to the user.
 fn send_room(stream: &mut TcpStream, room: &str) {
-    let _ = send_line(stream, &format!("\\room {}", room));
+    let _ = send_line(stream, &format!("{}{}", ROOM_PREFIX, room));
 }
 
 // Read one line from a client. None means the connection is finished, either
@@ -69,10 +69,11 @@ fn broadcast(clients: &Clients, room: &str, sender: &str, message: &str) {
     {
         let guard = clients.lock().unwrap();
         for (name, client) in guard.iter() {
-            if client.room == room && name != sender {
-                if let Ok(handle) = client.stream.try_clone() {
-                    targets.push(handle);
-                }
+            // A "let chain": the `let Ok(handle) = ...` only runs if the
+            // conditions before it were true, and `handle` is in scope for
+            // the body. Stable since the 2024 edition.
+            if client.room == room && name != sender && let Ok(handle) = client.stream.try_clone() {
+                targets.push(handle);
             }
         }
     }

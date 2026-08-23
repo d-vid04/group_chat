@@ -2,8 +2,8 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-const ADDRESS: &str = "127.0.0.1:8080";
-const DEFAULT_ROOM: &str = "general";
+use group_chat::protocol::{ADDRESS, DEFAULT_ROOM, ROOM_PREFIX};
+
 
 fn main() -> std::io::Result<()> {
     let stream = TcpStream::connect(ADDRESS).expect("Failed to connect");
@@ -57,7 +57,7 @@ fn main() -> std::io::Result<()> {
                     // `\room <name>` is the server telling us where we are.
                     // It is not a chat message, so update the prompt instead
                     // of printing it.
-                    if let Some(room) = text.strip_prefix("\\room ") {
+                    if let Some(room) = text.strip_prefix(ROOM_PREFIX) {
                         *reader_prompt.lock().unwrap() = format!("[{}] ", room);
                         continue;
                     }
