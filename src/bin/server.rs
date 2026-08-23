@@ -1,87 +1,369 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-// the shared roster: username -> a write handle for that client
-type Clients = Arc<Mutex<HashMap<String, TcpStream>>>;
+const ADDRESS: &str = "127.0.0.1:8080";
+const DEFAULT_ROOM: &str = "general";
 
-fn handle_client(mut stream : TcpStream, clients: Clients){
+const HELP: &str = r"Available commands:
+  \help                   show this message
+  \list_rooms             list the rooms and how many people are in each
+  \list_all               list the rooms and who is in each one
+  \people                 list the people in your current room
+  \create <room>          create a new room and join it
+  \create_hidden <room>   create a room that does not appear in listings
+  \join <room>            join a room that already exists
+  \quit                   leave the chat";
 
-    let respone = format!("Enter a username: ");
-    stream.write_all(respone.as_bytes()).expect("Failed to write respone to client");
-    let mut buffer = [0; 1024];
-        let _n = match stream.read(&mut buffer){
-            Ok(0) => return,
-            Ok(_n) => _n,
-            Err(e) =>{
-                eprintln!("client read error: {}", e);
-                return
-            }
-        };
-        let username = String::from_utf8_lossy(&buffer[.._n]).trim().to_string();
-        if username == "exit"{
-            return;
-        }
-        if clients.lock().unwrap().contains_key(&username){
-            let respone = format!("Username {} is already taken. Disconnecting.", username);
-            stream.write_all(respone.as_bytes()).expect("Failed to write respone to client");
-            return;
-        }
-    // register. try_clone gives the map its own handle, so other threads can
-    // write to this client while this thread keeps `stream` for reading.
-    match stream.try_clone() {
-        Ok(handle) => {
-            clients.lock().unwrap().insert(username.clone(), handle);
-        }
-        Err(e) => {
-            eprintln!("failed to clone stream for {}: {}", username, e);
-            return;
-        }
-    }
-    println!("{} joined ({} online)", username, clients.lock().unwrap().len());
-    stream.write_all(format!("{} connected to the server.\n", username).as_bytes()).expect("Failed to write connection message to client");
-
-    loop{
-        let mut buffer = [0; 1024];
-        let _n = match stream.read(&mut buffer){
-            Ok(0) => break,
-            Ok(_n) => _n,
-            Err(e) =>{
-                eprintln!("client read error: {}", e);
-                break;
-            }
-        };
-        let request = String::from_utf8_lossy(&buffer[.._n]).to_string();
-        if request.trim() == "exit"{
-            break;
-        }
-        let respone = format!("You wrote: {}", request);
-        if let Err(e) = stream.write_all(respone.as_bytes()) {
-            eprintln!("client write error: {}", e);
-            break;
-        }
-    }
-
-    // deregister on every exit path out of the loop
-    clients.lock().unwrap().remove(&username);
-    println!("{} left ({} online)", username, clients.lock().unwrap().len());
+// One connected user. `stream` is a write handle other threads use to send to
+// this user, and `room` is the single room they are currently in.
+struct Client {
+    stream: TcpStream,
+    room: String,
+    // Whether the room this user is in is hidden from listings. It is stored
+    // per person because a room only exists while somebody is in it, so the
+    // flag disappears together with the room when the last person leaves.
+    room_hidden: bool,
 }
 
+type Clients = Arc<Mutex<HashMap<String, Client>>>;
 
-fn main() -> std::io::Result<()>{
+// All server logging goes to stderr, so stdout stays clean.
+// Run `./server 2> debug.log` to send it to a file instead.
+fn debug(message: &str) {
+    eprintln!("[debug] {}", message);
+}
+
+// Every server -> client message is exactly one line. The client reads with
+// read_line, so the newline is what tells it a message has ended.
+fn send_line(stream: &mut TcpStream, message: &str) -> std::io::Result<()> {
+    writeln!(stream, "{}", message)
+}
+
+// Tell one client which room they are in. The client uses this to update its
+// prompt and does not show it to the user.
+fn send_room(stream: &mut TcpStream, room: &str) {
+    let _ = send_line(stream, &format!("\\room {}", room));
+}
+
+// Read one line from a client. None means the connection is finished, either
+// because the client disconnected or because the read failed.
+fn read_line(reader: &mut BufReader<TcpStream>) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim().to_string()),
+        Err(error) => {
+            debug(&format!("read error: {}", error));
+            None
+        }
+    }
+}
+
+// Send a message to everyone in `room` except `sender`.
+// The write handles are collected while the lock is held, then written to
+// after it is released, so one slow client cannot block the whole server.
+fn broadcast(clients: &Clients, room: &str, sender: &str, message: &str) {
+    let mut targets = Vec::new();
+    {
+        let guard = clients.lock().unwrap();
+        for (name, client) in guard.iter() {
+            if client.room == room && name != sender {
+                if let Ok(handle) = client.stream.try_clone() {
+                    targets.push(handle);
+                }
+            }
+        }
+    }
+    for mut target in targets {
+        let _ = send_line(&mut target, message);
+    }
+}
+
+// Which room is this user in right now?
+fn room_of(clients: &Clients, username: &str) -> String {
+    let guard = clients.lock().unwrap();
+    match guard.get(username) {
+        Some(client) => client.room.clone(),
+        None => DEFAULT_ROOM.to_string(),
+    }
+}
+
+// A room exists for as long as at least one person is in it. `general` is
+// always treated as existing, which is what keeps it alive when it empties.
+fn room_exists(clients: &Clients, room: &str) -> bool {
+    if room == DEFAULT_ROOM {
+        return true;
+    }
+    let guard = clients.lock().unwrap();
+    guard.values().any(|client| client.room == room)
+}
+
+// Is this room hidden? A room is hidden when the people in it say it is.
+// `general` can never be hidden.
+fn room_is_hidden(clients: &Clients, room: &str) -> bool {
+    if room == DEFAULT_ROOM {
+        return false;
+    }
+    let guard = clients.lock().unwrap();
+    guard
+        .values()
+        .any(|client| client.room == room && client.room_hidden)
+}
+
+// The people in one room, sorted. Works for hidden rooms too, which is what
+// lets \people show you who is in the private room you are actually in.
+fn people_in(clients: &Clients, room: &str) -> Vec<String> {
+    let guard = clients.lock().unwrap();
+    let mut names: Vec<String> = guard
+        .iter()
+        .filter(|(_, client)| client.room == room)
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+// Every room that shows up in a listing, with the people in it.
+// Hidden rooms are left out entirely. `general` is always included, even empty.
+fn visible_rooms(clients: &Clients) -> Vec<(String, Vec<String>)> {
+    let mut rooms: HashMap<String, Vec<String>> = HashMap::new();
+    rooms.insert(DEFAULT_ROOM.to_string(), Vec::new());
+    {
+        let guard = clients.lock().unwrap();
+        for (name, client) in guard.iter() {
+            if client.room_hidden {
+                continue;
+            }
+            rooms.entry(client.room.clone()).or_default().push(name.clone());
+        }
+    }
+    let mut list: Vec<(String, Vec<String>)> = rooms.into_iter().collect();
+    for (_, members) in list.iter_mut() {
+        members.sort();
+    }
+    list.sort();
+    list
+}
+
+// Move a user to another room and tell both rooms about it.
+fn move_to_room(clients: &Clients, username: &str, new_room: &str, hidden: bool) {
+    let old_room = room_of(clients, username);
+    if old_room == new_room {
+        return;
+    }
+
+    broadcast(clients, &old_room, username, &format!("* {} left the room", username));
+    {
+        let mut guard = clients.lock().unwrap();
+        if let Some(client) = guard.get_mut(username) {
+            client.room = new_room.to_string();
+            client.room_hidden = hidden;
+        }
+    }
+    broadcast(clients, new_room, username, &format!("* {} joined the room", username));
+
+    debug(&format!("{} moved from '{}' to '{}'", username, old_room, new_room));
+    if old_room != DEFAULT_ROOM && !room_exists(clients, &old_room) {
+        debug(&format!("room '{}' is empty and was destroyed", old_room));
+    }
+}
+
+fn handle_client(stream: TcpStream, clients: Clients) {
+    // Two handles to the same connection: one to read from, one to write to.
+    let mut writer = match stream.try_clone() {
+        Ok(handle) => handle,
+        Err(error) => {
+            debug(&format!("could not clone stream: {}", error));
+            return;
+        }
+    };
+    let mut reader = BufReader::new(stream);
+
+    // --- ask for a username ---
+    if send_line(&mut writer, "Enter a username:").is_err() {
+        return;
+    }
+    let username = match read_line(&mut reader) {
+        Some(name) => name,
+        None => return,
+    };
+    if username.is_empty() || username.starts_with('\\') {
+        let _ = send_line(&mut writer, "That username is not allowed. Disconnecting.");
+        return;
+    }
+
+    // --- register ---
+    // The "is it taken?" check and the insert happen under a single lock, so
+    // two people picking the same name at the same time cannot both get in.
+    let registered = {
+        let mut guard = clients.lock().unwrap();
+        if guard.contains_key(&username) {
+            false
+        } else {
+            match writer.try_clone() {
+                Ok(handle) => {
+                    guard.insert(
+                        username.clone(),
+                        Client {
+                            stream: handle,
+                            room: DEFAULT_ROOM.to_string(),
+                            room_hidden: false,
+                        },
+                    );
+                    true
+                }
+                Err(error) => {
+                    debug(&format!("could not clone stream for {}: {}", username, error));
+                    false
+                }
+            }
+        }
+    };
+    if !registered {
+        let _ = send_line(
+            &mut writer,
+            &format!("Username {} is already taken. Disconnecting.", username),
+        );
+        return;
+    }
+
+    debug(&format!("{} connected", username));
+    send_room(&mut writer, DEFAULT_ROOM);
+    let _ = send_line(
+        &mut writer,
+        &format!("Welcome {}! You are in the '{}' room.", username, DEFAULT_ROOM),
+    );
+    let _ = send_line(&mut writer, HELP);
+    broadcast(&clients, DEFAULT_ROOM, &username, &format!("* {} joined the room", username));
+
+    // --- main loop: one line in, one action ---
+    while let Some(line) = read_line(&mut reader) {
+        if line.is_empty() {
+            continue;
+        }
+
+        // Anything that does not start with a backslash is a chat message.
+        if !line.starts_with('\\') {
+            let room = room_of(&clients, &username);
+            broadcast(&clients, &room, &username, &format!("[{}] {}: {}", room, username, line));
+            continue;
+        }
+
+        // Split "\join general" into the command and its argument.
+        let mut parts = line.splitn(2, ' ');
+        let command = parts.next().unwrap_or("");
+        let argument = parts.next().unwrap_or("").trim().to_string();
+
+        match command {
+            "\\help" => {
+                let _ = send_line(&mut writer, HELP);
+            }
+            "\\list_rooms" => {
+                let _ = send_line(&mut writer, "Rooms:");
+                for (room, members) in visible_rooms(&clients) {
+                    let _ = send_line(
+                        &mut writer,
+                        &format!("  {} ({} online)", room, members.len()),
+                    );
+                }
+            }
+            "\\list_all" => {
+                let _ = send_line(&mut writer, "Rooms:");
+                for (room, members) in visible_rooms(&clients) {
+                    if members.is_empty() {
+                        let _ = send_line(&mut writer, &format!("  {} (empty)", room));
+                    } else {
+                        let _ = send_line(
+                            &mut writer,
+                            &format!("  {} ({} online): {}", room, members.len(), members.join(", ")),
+                        );
+                    }
+                }
+            }
+            "\\people" => {
+                let room = room_of(&clients, &username);
+                let members = people_in(&clients, &room);
+                let _ = send_line(
+                    &mut writer,
+                    &format!("People in '{}' ({}): {}", room, members.len(), members.join(", ")),
+                );
+            }
+            "\\create" | "\\create_hidden" => {
+                let hidden = command == "\\create_hidden";
+                if argument.is_empty() {
+                    let _ = send_line(&mut writer, &format!("Usage: {} <room>", command));
+                } else if room_exists(&clients, &argument) {
+                    let _ = send_line(
+                        &mut writer,
+                        &format!(r"Room '{}' already exists. Use \join instead.", argument),
+                    );
+                } else {
+                    move_to_room(&clients, &username, &argument, hidden);
+                    send_room(&mut writer, &argument);
+                    let kind = if hidden { "hidden room" } else { "room" };
+                    let _ = send_line(
+                        &mut writer,
+                        &format!("Created {} '{}' and joined it.", kind, argument),
+                    );
+                }
+            }
+            "\\join" => {
+                if argument.is_empty() {
+                    let _ = send_line(&mut writer, r"Usage: \join <room>");
+                } else if !room_exists(&clients, &argument) {
+                    let _ = send_line(
+                        &mut writer,
+                        &format!(r"Room '{}' does not exist. Use \create to make it.", argument),
+                    );
+                } else if argument == room_of(&clients, &username) {
+                    let _ = send_line(&mut writer, &format!("You are already in '{}'.", argument));
+                } else {
+                    // A room keeps whatever visibility it already had, so joining
+                    // a hidden room does not accidentally expose it in listings.
+                    let hidden = room_is_hidden(&clients, &argument);
+                    move_to_room(&clients, &username, &argument, hidden);
+                    send_room(&mut writer, &argument);
+                    let _ = send_line(&mut writer, &format!("Joined '{}'.", argument));
+                }
+            }
+            "\\quit" => break,
+            _ => {
+                let _ = send_line(
+                    &mut writer,
+                    &format!(r"Unknown command '{}'. Type \help for the list.", command),
+                );
+            }
+        }
+    }
+
+    // --- cleanup: runs however the loop ended ---
+    let last_room = {
+        let mut guard = clients.lock().unwrap();
+        guard.remove(&username).map(|client| client.room)
+    };
+    if let Some(room) = last_room {
+        broadcast(&clients, &room, &username, &format!("* {} left the chat", username));
+        debug(&format!("{} disconnected (was in '{}')", username, room));
+        if room != DEFAULT_ROOM && !room_exists(&clients, &room) {
+            debug(&format!("room '{}' is empty and was destroyed", room));
+        }
+    }
+}
+
+fn main() -> std::io::Result<()> {
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let listener = TcpListener::bind("127.0.0.1:8080").expect("Failed to bind to address");
-    println!("Server listening on port 8080");
+    let listener = TcpListener::bind(ADDRESS).expect("Failed to bind to address");
+    debug(&format!("server listening on {}", ADDRESS));
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let clients = Arc::clone(&clients);
                 std::thread::spawn(move || handle_client(stream, clients));
             }
-            Err(e) => {
-                eprintln!("Connection failed: {}", e)
-            }
+            Err(error) => debug(&format!("connection failed: {}", error)),
         }
     }
     Ok(())
