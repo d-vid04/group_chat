@@ -17,6 +17,35 @@ pub const ADDRESS: &str = "127.0.0.1:8080";
 /// The room everyone starts in. It is never destroyed, even when empty.
 pub const DEFAULT_ROOM: &str = "general";
 
+/// Which address to use, taken from the command line.
+///
+/// ```text
+/// ./server                 the default in ADDRESS
+/// ./server 9000            port 9000 on the default host
+/// ./server 1.2.3.4:9000    that exact address
+/// ```
+pub fn address_from_args() -> String {
+    resolve_address(std::env::args().nth(1))
+}
+
+// Split out from address_from_args so it can be tested without touching the
+// real command line.
+fn resolve_address(argument: Option<String>) -> String {
+    let host = ADDRESS.split(':').next().unwrap_or("127.0.0.1");
+    match argument {
+        None => ADDRESS.to_string(),
+        // Anything containing a colon is treated as a whole address.
+        Some(text) if text.contains(':') => text,
+        Some(text) => match text.parse::<u16>() {
+            Ok(port) => format!("{}:{}", host, port),
+            Err(_) => {
+                eprintln!("'{}' is not a port number; using {}", text, ADDRESS);
+                ADDRESS.to_string()
+            }
+        },
+    }
+}
+
 // --- control lines -------------------------------------------------------
 // These are not chat. The client acts on them and does not display them.
 
@@ -169,6 +198,18 @@ mod tests {
     fn public_keys_survive_a_round_trip_through_text() {
         let (_, public) = keypair();
         assert_eq!(decode_public(&encode_public(&public)), Some(public));
+    }
+
+    #[test]
+    fn the_address_comes_from_the_argument() {
+        assert_eq!(resolve_address(None), ADDRESS);
+        assert_eq!(resolve_address(Some("9000".to_string())), "127.0.0.1:9000");
+        assert_eq!(
+            resolve_address(Some("1.2.3.4:9000".to_string())),
+            "1.2.3.4:9000"
+        );
+        // Not a port and not an address: fall back rather than crash.
+        assert_eq!(resolve_address(Some("banana".to_string())), ADDRESS);
     }
 
     #[test]

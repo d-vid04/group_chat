@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 // The server builds \room, \members and \from lines, so it needs those
 // prefixes. It matches bare command words like "\pubkey" and "\to" directly,
 // which is why those two prefix constants are only used by the client.
-use group_chat::protocol::{ADDRESS, DEFAULT_ROOM, FROM_PREFIX, MEMBERS_PREFIX, ROOM_PREFIX};
+use group_chat::protocol::{
+    DEFAULT_ROOM, FROM_PREFIX, MEMBERS_PREFIX, ROOM_PREFIX, address_from_args,
+};
 
 
 const HELP: &str = r"Available commands:
@@ -445,9 +447,12 @@ fn handle_client(stream: TcpStream, clients: Clients) {
 }
 
 fn main() -> std::io::Result<()> {
+    // ./server            listen on the default address
+    // ./server 9000       listen on port 9000
+    let address = address_from_args();
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let listener = TcpListener::bind(ADDRESS).expect("Failed to bind to address");
-    debug(&format!("server listening on {}", ADDRESS));
+    let listener = TcpListener::bind(&address).expect("Failed to bind to address");
+    debug(&format!("server listening on {}", address));
 
     for stream in listener.incoming() {
         match stream {

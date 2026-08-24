@@ -4,8 +4,8 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
 use group_chat::protocol::{
-    ADDRESS, DEFAULT_ROOM, FROM_PREFIX, MEMBERS_PREFIX, PUBKEY_PREFIX, ROOM_PREFIX, TO_PREFIX,
-    decode_public, encode_public, open, seal, shared_key,
+    DEFAULT_ROOM, FROM_PREFIX, MEMBERS_PREFIX, PUBKEY_PREFIX, ROOM_PREFIX, TO_PREFIX,
+    address_from_args, decode_public, encode_public, open, seal, shared_key,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -20,7 +20,10 @@ fn main() -> std::io::Result<()> {
     let secret = Arc::new(StaticSecret::random_from_rng(&mut rand::rng()));
     let public = PublicKey::from(secret.as_ref());
 
-    let stream = TcpStream::connect(ADDRESS).expect("Failed to connect");
+    // ./client            connect to the default address
+    // ./client 9000       connect to port 9000
+    let address = address_from_args();
+    let stream = TcpStream::connect(&address).expect("Failed to connect");
     let mut writer = stream.try_clone().expect("Failed to clone stream");
     let mut reader = BufReader::new(stream);
 
