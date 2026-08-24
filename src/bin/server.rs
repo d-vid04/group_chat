@@ -3,7 +3,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
-use group_chat::protocol::{ADDRESS, DEFAULT_ROOM, ROOM_PREFIX};
+// The server builds \room, \members and \from lines, so it needs those
+// prefixes. It matches bare command words like "\pubkey" and "\to" directly,
+// which is why those two prefix constants are only used by the client.
+use group_chat::protocol::{ADDRESS, DEFAULT_ROOM, FROM_PREFIX, MEMBERS_PREFIX, ROOM_PREFIX};
 
 
 const HELP: &str = r"Available commands:
@@ -25,6 +28,10 @@ struct Client {
     // per person because a room only exists while somebody is in it, so the
     // flag disappears together with the room when the last person leaves.
     room_hidden: bool,
+    // This user's X25519 public key, base64 encoded. The server passes it on
+    // to other members so they can encrypt to this user; it never holds a
+    // private key and never sees a plaintext message.
+    pubkey: Option<String>,
 }
 
 type Clients = Arc<Mutex<HashMap<String, Client>>>;
@@ -79,6 +86,49 @@ fn broadcast(clients: &Clients, room: &str, sender: &str, message: &str) {
     }
     for mut target in targets {
         let _ = send_line(&mut target, message);
+    }
+}
+
+// Send one line to one named person, but only if they are in `room`. This is
+// what stops a client from delivering blobs to people outside its own room.
+fn send_to_member(clients: &Clients, room: &str, recipient: &str, message: &str) -> bool {
+    let handle = {
+        let guard = clients.lock().unwrap();
+        match guard.get(recipient) {
+            Some(client) if client.room == room => client.stream.try_clone().ok(),
+            _ => None,
+        }
+    };
+    match handle {
+        Some(mut stream) => send_line(&mut stream, message).is_ok(),
+        None => false,
+    }
+}
+
+// Tell everyone in a room who else is there, and what their public keys are.
+// Clients need this to encrypt: there is one ciphertext per recipient, so a
+// sender has to know exactly who is listening right now. Sent whenever the
+// membership of a room changes.
+fn send_member_list(clients: &Clients, room: &str) {
+    let (line, targets) = {
+        let guard = clients.lock().unwrap();
+        let mut entries = Vec::new();
+        let mut targets = Vec::new();
+        for (name, client) in guard.iter() {
+            if client.room == room {
+                if let Some(key) = &client.pubkey {
+                    entries.push(format!("{}={}", name, key));
+                }
+                if let Ok(handle) = client.stream.try_clone() {
+                    targets.push(handle);
+                }
+            }
+        }
+        entries.sort();
+        (format!("{}{}", MEMBERS_PREFIX, entries.join(" ")), targets)
+    };
+    for mut target in targets {
+        let _ = send_line(&mut target, &line);
     }
 }
 
@@ -165,6 +215,9 @@ fn move_to_room(clients: &Clients, username: &str, new_room: &str, hidden: bool)
     }
     broadcast(clients, new_room, username, &format!("* {} joined the room", username));
 
+    send_member_list(clients, &old_room);
+    send_member_list(clients, new_room);
+
     debug(&format!("{} moved from '{}' to '{}'", username, old_room, new_room));
     if old_room != DEFAULT_ROOM && !room_exists(clients, &old_room) {
         debug(&format!("room '{}' is empty and was destroyed", old_room));
@@ -211,6 +264,7 @@ fn handle_client(stream: TcpStream, clients: Clients) {
                             stream: handle,
                             room: DEFAULT_ROOM.to_string(),
                             room_hidden: false,
+                            pubkey: None,
                         },
                     );
                     true
@@ -245,10 +299,15 @@ fn handle_client(stream: TcpStream, clients: Clients) {
             continue;
         }
 
-        // Anything that does not start with a backslash is a chat message.
+        // Chat never arrives as plaintext: the client seals every message and
+        // sends it as a `\to` line. Anything else here is a client that does
+        // not speak the protocol, and relaying it would break the promise that
+        // the server cannot read messages.
         if !line.starts_with('\\') {
-            let room = room_of(&clients, &username);
-            broadcast(&clients, &room, &username, &format!("[{}] {}: {}", room, username, line));
+            let _ = send_line(
+                &mut writer,
+                "Messages must be encrypted. Use the client, not a raw connection.",
+            );
             continue;
         }
 
@@ -258,6 +317,37 @@ fn handle_client(stream: TcpStream, clients: Clients) {
         let argument = parts.next().unwrap_or("").trim().to_string();
 
         match command {
+            // The client registers its public key once, just after connecting.
+            "\\pubkey" => {
+                {
+                    let mut guard = clients.lock().unwrap();
+                    if let Some(client) = guard.get_mut(&username) {
+                        client.pubkey = Some(argument.clone());
+                    }
+                }
+                send_member_list(&clients, &room_of(&clients, &username));
+            }
+            // Relay one sealed blob to one person in the same room. The
+            // argument is "<recipient> <base64>", and the server treats the
+            // base64 as opaque -- it has no key and cannot open it.
+            "\\to" => {
+                let mut parts = argument.splitn(2, ' ');
+                let recipient = parts.next().unwrap_or("").to_string();
+                let sealed = parts.next().unwrap_or("");
+                let room = room_of(&clients, &username);
+                let delivered = send_to_member(
+                    &clients,
+                    &room,
+                    &recipient,
+                    &format!("{}{} {}", FROM_PREFIX, username, sealed),
+                );
+                if !delivered {
+                    let _ = send_line(
+                        &mut writer,
+                        &format!("Could not deliver to '{}' -- not in your room.", recipient),
+                    );
+                }
+            }
             "\\help" => {
                 let _ = send_line(&mut writer, HELP);
             }
@@ -345,6 +435,7 @@ fn handle_client(stream: TcpStream, clients: Clients) {
         guard.remove(&username).map(|client| client.room)
     };
     if let Some(room) = last_room {
+        send_member_list(&clients, &room);
         broadcast(&clients, &room, &username, &format!("* {} left the chat", username));
         debug(&format!("{} disconnected (was in '{}')", username, room));
         if room != DEFAULT_ROOM && !room_exists(&clients, &room) {
