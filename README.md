@@ -211,7 +211,3 @@ addresses resolve correctly.
 - If a message arrives while you are half-way through typing, the line is redrawn
   and your typed characters stay in the terminal's buffer — press enter and they
   still send, they are just no longer shown.
-
-See [fixes_and_improvements.md](fixes_and_improvements.md) for the development
-history: bugs that were fixed, why the code is shaped the way it is, and the
-trade-offs behind each decision.
